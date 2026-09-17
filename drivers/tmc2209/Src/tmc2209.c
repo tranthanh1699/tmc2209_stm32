@@ -1,6 +1,6 @@
 /**
  * @file    tmc2209.c
- * @brief   Driver TMC2209 qua UART cho STM32 HAL.
+ * @brief   TMC2209 driver over UART for STM32 HAL.
  *
  * Frame (datasheet TMC2209 §4):
  *   Write      : [0x05][ADDR][REG|0x80][D31..24][D23..16][D15..8][D7..0][CRC]
@@ -22,7 +22,7 @@ static uint32_t clamp_u32(uint32_t v, uint32_t lo, uint32_t hi)
     return (v < lo) ? lo : ((v > hi) ? hi : v);
 }
 
-/* Arduino map() cho số nguyên dương */
+/* Arduino map() for positive integers */
 static uint32_t map_u32(uint32_t x, uint32_t in_min, uint32_t in_max,
                         uint32_t out_min, uint32_t out_max)
 {
@@ -34,7 +34,7 @@ static uint8_t current_to_pct(uint8_t cs)     { return (uint8_t)map_u32(cs, 0, 3
 static uint8_t pct_to_hold_delay(uint8_t pct) { return (uint8_t)map_u32(clamp_u32(pct, 0, 100), 0, 100, 0, 15); }
 static uint8_t hold_delay_to_pct(uint8_t hd)  { return (uint8_t)map_u32(hd, 0, 15, 0, 100); }
 
-/** CRC8 theo datasheet (poly 0x07, xử lý bit LSB-first của mỗi byte). */
+/** CRC8 per the datasheet (poly 0x07, processes each byte's bits LSB-first). */
 static uint8_t tmc_crc8(const uint8_t *data, uint8_t len)
 {
     uint8_t crc = 0;
@@ -65,13 +65,13 @@ static tmc_status_t bus_error(tmc_bus_t *bus, tmc_status_t s)
 }
 
 /* ========================================================================== */
-/*  Lớp vận chuyển UART                                                        */
+/*  UART transport layer                                                       */
 /* ========================================================================== */
 
 static void uart_flush_rx(UART_HandleTypeDef *h)
 {
     (void)HAL_UART_AbortReceive(h);
-    __HAL_UART_CLEAR_OREFLAG(h);          /* F1/F4: đọc SR+DR; F7/H7/G4/L4: ICR */
+    __HAL_UART_CLEAR_OREFLAG(h);          /* F1/F4: read SR+DR; F7/H7/G4/L4: ICR */
 #ifdef UART_RXDATA_FLUSH_REQUEST
     __HAL_UART_SEND_REQ(h, UART_RXDATA_FLUSH_REQUEST);
 #endif
@@ -96,9 +96,9 @@ static tmc_status_t uart_wait_rx_it(UART_HandleTypeDef *h, uint32_t timeout_ms)
 }
 
 /**
- * Gửi tx[0..txlen) và (nếu rxlen > 0) nhận rxlen byte reply.
- * TMC_UART_TX_RX: TX và RX nối chung -> nhận txlen byte echo + rxlen byte reply.
- * Echo được so khớp để phát hiện va chạm/nhiễu trên bus.
+ * Send tx[0..txlen) and (if rxlen > 0) receive rxlen reply bytes.
+ * TMC_UART_TX_RX: TX and RX are tied together -> receives txlen echo bytes + rxlen reply bytes.
+ * The echo is checked to detect bus collisions/noise.
  */
 static tmc_status_t bus_xfer(tmc_bus_t *bus, const uint8_t *tx, uint8_t txlen,
                              uint8_t *rx, uint8_t rxlen)
@@ -122,7 +122,7 @@ static tmc_status_t bus_xfer(tmc_bus_t *bus, const uint8_t *tx, uint8_t txlen,
             return TMC_ERR_PARAM;
         }
         uart_flush_rx(h);
-        /* Bật nhận bằng ngắt TRƯỚC khi phát, để không mất byte echo */
+        /* Enable receive-by-interrupt BEFORE transmitting, so the echo byte isn't missed */
         if (HAL_UART_Receive_IT(h, buf, total) != HAL_OK) {
             return TMC_ERR_UART;
         }
@@ -182,7 +182,7 @@ tmc_status_t tmc_bus_init(tmc_bus_t *bus, UART_HandleTypeDef *huart, tmc_uart_mo
     bus->timeout_ms = TMC_DEFAULT_TIMEOUT_MS;
     bus->retries    = TMC_DEFAULT_RETRIES;
     if (mode == TMC_UART_HALF_DUPLEX) {
-        (void)HAL_HalfDuplex_EnableReceiver(huart);   /* thả line khi rảnh */
+        (void)HAL_HalfDuplex_EnableReceiver(huart);   /* release the line while idle */
     }
     return TMC_OK;
 }
@@ -200,7 +200,7 @@ bool tmc_bus_can_read(const tmc_bus_t *bus)
 }
 
 /* ========================================================================== */
-/*  Register low-level                                                         */
+/*  Low-level register access                                                  */
 /* ========================================================================== */
 
 tmc_status_t tmc2209_write_reg(tmc2209_t *dev, uint8_t reg, uint32_t value)
@@ -266,19 +266,19 @@ tmc_status_t tmc2209_read_reg(tmc2209_t *dev, uint8_t reg, uint32_t *value)
         if (st == TMC_ERR_PARAM) {
             break;
         }
-        TMC_DELAY_MS(1);   /* để bus về idle trước khi thử lại */
+        TMC_DELAY_MS(1);   /* let the bus return to idle before retrying */
     }
     bus_unlock(dev->bus);
     return bus_error(dev->bus, st);
 }
 
-/* ---- ghi shadow ----------------------------------------------------------- */
+/* ---- shadow writes ---------------------------------------------------------- */
 static tmc_status_t write_gconf(tmc2209_t *d)    { return tmc2209_write_reg(d, TMC_REG_GCONF, d->gconf); }
 static tmc_status_t write_chopconf(tmc2209_t *d) { return tmc2209_write_reg(d, TMC_REG_CHOPCONF, d->chopconf); }
 static tmc_status_t write_pwmconf(tmc2209_t *d)  { return tmc2209_write_reg(d, TMC_REG_PWMCONF, d->pwmconf); }
 static tmc_status_t write_coolconf(tmc2209_t *d) { return tmc2209_write_reg(d, TMC_REG_COOLCONF, d->coolconf); }
 
-/* Giống writeStoredDriverCurrent(): SEIMIN tự chọn theo IRUN */
+/* Like writeStoredDriverCurrent(): SEIMIN is auto-selected based on IRUN */
 static tmc_status_t write_driver_current(tmc2209_t *d)
 {
     uint8_t irun = (uint8_t)TMC_FIELD_GET(d->ihold_irun, IRUN_Msk, IRUN_Pos);
@@ -291,7 +291,7 @@ static tmc_status_t write_driver_current(tmc2209_t *d)
 }
 
 /* ========================================================================== */
-/*  Khởi tạo                                                                   */
+/*  Initialization                                                             */
 /* ========================================================================== */
 
 static tmc_status_t set_registers_to_defaults(tmc2209_t *d)
@@ -340,7 +340,7 @@ tmc_status_t tmc2209_init(tmc2209_t *dev, tmc_bus_t *bus, uint8_t addr)
     dev->addr = addr;
     dev->toff = TMC_TOFF_DEFAULT;
 
-    /* Bus 2 chiều: kiểm tra chip có trả lời trước (VS phải có điện!) */
+    /* Two-way bus: check the chip responds first (VS must be powered!) */
     if (tmc_bus_can_read(bus) && !tmc2209_is_communicating(dev)) {
         return TMC_ERR_NOT_READY;
     }
@@ -349,7 +349,7 @@ tmc_status_t tmc2209_init(tmc2209_t *dev, tmc_bus_t *bus, uint8_t addr)
     dev->gconf = GCONF_PDN_DISABLE_Msk | GCONF_MSTEP_REG_SELECT_Msk | GCONF_MULTISTEP_FILT_Msk;
     TMC_TRY(write_gconf(dev));
 
-    /* Bus 2 chiều: SENDDELAY >= 2 (khuyến nghị khi nhiều địa chỉ) */
+    /* Two-way bus: SENDDELAY >= 2 (recommended with multiple addresses) */
     if (tmc_bus_can_read(bus)) {
         TMC_TRY(tmc2209_set_reply_delay(dev, 2));
     }
@@ -404,7 +404,7 @@ tmc_status_t tmc2209_restore_to_chip(tmc2209_t *dev)
 }
 
 /* ========================================================================== */
-/*  Enable / microstep / dòng                                                  */
+/*  Enable / microstep / current                                              */
 /* ========================================================================== */
 
 void tmc2209_set_hardware_enable_pin(tmc2209_t *dev, GPIO_TypeDef *port, uint16_t pin)
@@ -412,7 +412,7 @@ void tmc2209_set_hardware_enable_pin(tmc2209_t *dev, GPIO_TypeDef *port, uint16_
     dev->en_port = port;
     dev->en_pin  = pin;
     if (port != NULL) {
-        HAL_GPIO_WritePin(port, pin, GPIO_PIN_SET);   /* EN active-low -> disable */
+        HAL_GPIO_WritePin(port, pin, GPIO_PIN_SET);   /* EN is active-low -> disable */
     }
 }
 
@@ -436,7 +436,7 @@ tmc_status_t tmc2209_disable(tmc2209_t *dev)
 
 tmc_status_t tmc2209_set_microsteps_per_step(tmc2209_t *dev, uint16_t microsteps)
 {
-    /* Sửa lỗi nhỏ của bản gốc: dùng giá trị đã constrain */
+    /* Fix a small bug in the original: use the constrained value */
     uint16_t v = (uint16_t)clamp_u32(microsteps, 1, 256);
     uint8_t  exponent = 0;
     while (v > 1U) {
@@ -460,7 +460,7 @@ uint16_t tmc2209_get_microsteps_per_step(const tmc2209_t *dev)
 {
     uint8_t mres = (uint8_t)TMC_FIELD_GET(dev->chopconf, CHOP_MRES_Msk, CHOP_MRES_Pos);
     if (mres > 8U) {
-        mres = 0U;   /* giá trị không hợp lệ -> coi như 256 */
+        mres = 0U;   /* invalid value -> treat as 256 */
     }
     return (uint16_t)(1U << (8U - mres));
 }
@@ -494,7 +494,7 @@ tmc_status_t tmc2209_set_all_current_values(tmc2209_t *dev, uint8_t run_pct,
 
 tmc_status_t tmc2209_set_rms_current(tmc2209_t *dev, uint16_t mA, float r_sense, float hold_multiplier)
 {
-    /* Công thức từ TMCStepper (bản gốc cũng dùng) */
+    /* Formula from TMCStepper (the original library also uses it) */
     float cs = 32.0f * 1.41421f * (float)mA / 1000.0f * (r_sense + 0.02f) / 0.325f - 1.0f;
     int32_t ics;
 
@@ -517,7 +517,7 @@ tmc_status_t tmc2209_set_rms_current(tmc2209_t *dev, uint16_t mA, float r_sense,
 }
 
 /* ========================================================================== */
-/*  Các bit cấu hình                                                           */
+/*  Configuration bits                                                         */
 /* ========================================================================== */
 
 #define CHOP_BIT_FN(name, msk, on) \
@@ -631,7 +631,7 @@ tmc_status_t tmc2209_set_cool_step_measurement_count(tmc2209_t *dev, tmc_sg_coun
 }
 
 /* ========================================================================== */
-/*  Vận tốc qua UART (VACTUAL)                                                 */
+/*  Velocity over UART (VACTUAL)                                               */
 /* ========================================================================== */
 
 tmc_status_t tmc2209_move_at_velocity(tmc2209_t *dev, int32_t vactual)
@@ -671,7 +671,7 @@ tmc_status_t tmc2209_velocity_ramp_set(tmc2209_t *dev, float target_usteps_per_s
     dev->vr_last_ms = TMC_GET_TICK_MS();
     dev->vr_active  = true;
     if (dev->vr_accel == 0.0f) {
-        return tmc2209_velocity_ramp_task(dev);   /* không ramp: ghi ngay */
+        return tmc2209_velocity_ramp_task(dev);   /* no ramp: write immediately */
     }
     return TMC_OK;
 }
@@ -716,7 +716,7 @@ bool tmc2209_velocity_ramp_reached(const tmc2209_t *dev)
 }
 
 /* ========================================================================== */
-/*  API đọc                                                                    */
+/*  Read API                                                                   */
 /* ========================================================================== */
 
 tmc_status_t tmc2209_get_version(tmc2209_t *dev, uint8_t *version)

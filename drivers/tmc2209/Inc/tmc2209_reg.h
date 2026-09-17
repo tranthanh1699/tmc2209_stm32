@@ -1,24 +1,24 @@
 /**
  * @file    tmc2209_reg.h
- * @brief   Register map TMC2209 (đối chiếu datasheet + janelia-arduino/TMC2209).
- *          Dùng macro mask/shift thay cho bitfield để không phụ thuộc compiler
- *          về thứ tự bit.
+ * @brief   TMC2209 register map (cross-checked against the datasheet +
+ *          janelia-arduino/TMC2209). Uses mask/shift macros instead of
+ *          bitfields so it does not depend on compiler bit ordering.
  */
 #ifndef TMC2209_REG_H
 #define TMC2209_REG_H
 
 #include <stdint.h>
 
-/* ---- Frame --------------------------------------------------------------- */
-#define TMC_SYNC                   0x05U  /* 0b0101 + 4 bit reserved           */
-#define TMC_REPLY_ADDR             0xFFU  /* địa chỉ master trong frame reply   */
+/* ---- Frame ----------------------------------------------------------------- */
+#define TMC_SYNC                   0x05U  /* 0b0101 + 4 reserved bits           */
+#define TMC_REPLY_ADDR             0xFFU  /* master address in the reply frame  */
 #define TMC_RW_WRITE               0x80U
 #define TMC_WRITE_FRAME_LEN        8U
 #define TMC_READ_REQ_LEN           4U
 #define TMC_READ_REPLY_LEN         8U
-#define TMC_MAX_ADDR               3U     /* 0..3 chọn bằng chân MS1/MS2       */
+#define TMC_MAX_ADDR               3U     /* 0..3 selected via MS1/MS2 pins     */
 
-/* ---- Địa chỉ register ------------------------------------------------------ */
+/* ---- Register addresses ----------------------------------------------------- */
 #define TMC_REG_GCONF              0x00U  /* RW  */
 #define TMC_REG_GSTAT              0x01U  /* RC  */
 #define TMC_REG_IFCNT              0x02U  /* R   */
@@ -44,7 +44,7 @@
 #define TMC_REG_PWM_SCALE          0x71U  /* R   */
 #define TMC_REG_PWM_AUTO           0x72U  /* R   */
 
-/* ---- Helper field ---------------------------------------------------------- */
+/* ---- Field helpers ----------------------------------------------------------- */
 #define TMC_FIELD_GET(reg, msk, pos)     (((reg) & (msk)) >> (pos))
 #define TMC_FIELD_SET(reg, msk, pos, v)  ((reg) = ((reg) & ~(msk)) | ((((uint32_t)(v)) << (pos)) & (msk)))
 #define TMC_BIT_WRITE(reg, msk, on)      ((reg) = (on) ? ((reg) | (msk)) : ((reg) & ~(msk)))
@@ -155,12 +155,12 @@
 /* ---- PWM_SCALE (0x71) / PWM_AUTO (0x72) ------------------------------------ */
 #define PWM_SCALE_SUM_Msk          ((uint32_t)0xFFU << 0)
 #define PWM_SCALE_AUTO_Pos         16U
-#define PWM_SCALE_AUTO_Msk         ((uint32_t)0x1FFU << 16)   /* 9 bit có dấu */
+#define PWM_SCALE_AUTO_Msk         ((uint32_t)0x1FFU << 16)   /* 9-bit signed value */
 #define PWM_OFS_AUTO_Msk           ((uint32_t)0xFFU << 0)
 #define PWM_GRAD_AUTO_Pos          16U
 #define PWM_GRAD_AUTO_Msk          ((uint32_t)0xFFU << 16)
 
-/* ---- Mặc định (giống thư viện gốc) ----------------------------------------- */
+/* ---- Defaults (matching the original library) ------------------------------- */
 #define TMC_CHOPCONF_DEFAULT       0x10000053U
 #define TMC_PWMCONF_DEFAULT        0xC10D0024U
 #define TMC_IHOLD_DEFAULT          16U
@@ -173,7 +173,7 @@
 #define TMC_HSTRT_DEFAULT          5U
 #define TMC_SEIMIN_IRUN_LIMIT      20U
 
-/* VACTUAL: v[µstep/s] = VACTUAL * fCLK / 2^24; fCLK nội 12 MHz -> ~0.715 /LSB */
+/* VACTUAL: v[µstep/s] = VACTUAL * fCLK / 2^24; internal fCLK 12 MHz -> ~0.715 /LSB */
 #define TMC_VACTUAL_HZ_PER_LSB     (12000000.0f / 16777216.0f)
 #define TMC_VACTUAL_MAX            ((int32_t)((1L << 23) - 1))
 

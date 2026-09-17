@@ -1,12 +1,12 @@
 /**
  * @file    tmc2209.h
- * @brief   Driver TMC2209 qua UART cho STM32 HAL (port C từ janelia-arduino/TMC2209).
+ * @brief   TMC2209 driver over UART for STM32 HAL (C port of janelia-arduino/TMC2209).
  *
- * Kiến trúc 2 lớp:
- *   - tmc2209.h/.c        : UART bus + cấu hình register + VACTUAL (vận tốc qua UART)
- *   - tmc2209_motion.h/.c : bộ phát xung STEP/DIR có ramp (vị trí / vận tốc / vị trí+vận tốc)
+ * Two-layer architecture:
+ *   - tmc2209.h/.c        : UART bus + register configuration + VACTUAL (velocity over UART)
+ *   - tmc2209_motion.h/.c : STEP/DIR pulse generator with ramp (position / velocity / position+velocity)
  *
- * Nhiều driver trên 1 UART: tạo 1 tmc_bus_t, nhiều tmc2209_t với addr 0..3.
+ * Multiple drivers on 1 UART: create 1 tmc_bus_t, and several tmc2209_t with addr 0..3.
  */
 #ifndef TMC2209_H
 #define TMC2209_H
@@ -21,43 +21,43 @@ extern "C" {
 #include "tmc2209_reg.h"
 
 /* ========================================================================== */
-/*  Kiểu dữ liệu                                                              */
+/*  Data types                                                                 */
 /* ========================================================================== */
 
 typedef enum {
     TMC_OK = 0,
-    TMC_ERR_PARAM,      /* tham số sai / chưa init                            */
-    TMC_ERR_TX,         /* HAL_UART_Transmit lỗi                              */
-    TMC_ERR_TIMEOUT,    /* không nhận đủ byte                                  */
-    TMC_ERR_ECHO,       /* echo không khớp frame đã gửi (va chạm / nhiễu)     */
-    TMC_ERR_CRC,        /* CRC reply sai                                       */
-    TMC_ERR_REPLY,      /* reply sai sync/addr/register                        */
-    TMC_ERR_NO_RX,      /* bus đang ở chế độ TX-only, không đọc được           */
-    TMC_ERR_UART,       /* lỗi phần cứng UART (ORE/FE/NE)                      */
-    TMC_ERR_NOT_READY   /* chip không phản hồi / sai version                   */
+    TMC_ERR_PARAM,      /* invalid parameter / not initialized                */
+    TMC_ERR_TX,         /* HAL_UART_Transmit failed                           */
+    TMC_ERR_TIMEOUT,    /* did not receive enough bytes                       */
+    TMC_ERR_ECHO,       /* echo does not match the frame sent (collision / noise) */
+    TMC_ERR_CRC,        /* wrong reply CRC                                     */
+    TMC_ERR_REPLY,      /* wrong reply sync/addr/register                     */
+    TMC_ERR_NO_RX,      /* bus is in TX-only mode, cannot read                */
+    TMC_ERR_UART,       /* UART hardware error (ORE/FE/NE)                    */
+    TMC_ERR_NOT_READY   /* chip not responding / wrong version                */
 } tmc_status_t;
 
 typedef enum {
-    /* Chỉ nối TX -> PDN_UART (qua 1k). Chỉ ghi, getter trả về shadow register. */
+    /* TX only -> PDN_UART (through a 1k resistor). Write-only, getters return the shadow register. */
     TMC_UART_TX_ONLY = 0,
-    /* TX và RX của MCU cùng nối vào PDN_UART (TX qua 1k). UART full-duplex bình
-     * thường trong CubeMX. MCU sẽ nhận lại echo của chính nó -> thư viện tự bỏ. */
+    /* MCU TX and RX both wired to PDN_UART (TX through 1k). Normal full-duplex
+     * UART in CubeMX. The MCU will receive its own echo back -> the library discards it. */
     TMC_UART_TX_RX,
-    /* CubeMX chọn "Single Wire (Half-Duplex)": 1 chân TX nối PDN_UART.
-     * Thư viện tự gọi HAL_HalfDuplex_EnableTransmitter/Receiver.             */
+    /* CubeMX set to "Single Wire (Half-Duplex)": one TX pin wired to PDN_UART.
+     * The library calls HAL_HalfDuplex_EnableTransmitter/Receiver itself.     */
     TMC_UART_HALF_DUPLEX
 } tmc_uart_mode_t;
 
 typedef struct {
     UART_HandleTypeDef *huart;
     tmc_uart_mode_t     mode;
-    uint32_t            timeout_ms;   /* timeout nhận reply                   */
-    uint8_t             retries;      /* số lần thử lại khi đọc lỗi           */
-    /* Tuỳ chọn cho RTOS: nhiều task dùng chung bus. Để NULL nếu bare-metal. */
+    uint32_t            timeout_ms;   /* reply receive timeout                */
+    uint8_t             retries;      /* number of retries on a read error    */
+    /* Optional for RTOS: multiple tasks sharing the bus. Leave NULL for bare-metal. */
     void              (*lock)(void *ctx);
     void              (*unlock)(void *ctx);
     void               *lock_ctx;
-    /* Thống kê */
+    /* Statistics */
     uint32_t            err_count;
     tmc_status_t        last_err;
 } tmc_bus_t;
@@ -79,13 +79,13 @@ typedef enum {
     TMC_SG_COUNT_2  = 2, TMC_SG_COUNT_1 = 3
 } tmc_sg_count_t;
 
-/** Handle cho 1 driver. Shadow register cần thiết vì nhiều register là
- *  write-only (IHOLD_IRUN, COOLCONF...) và để chạy được ở chế độ TX-only. */
+/** Handle for one driver. A shadow register is required because several
+ *  registers are write-only (IHOLD_IRUN, COOLCONF...) and to support TX-only mode. */
 typedef struct {
     tmc_bus_t     *bus;
-    uint8_t        addr;            /* 0..3 theo MS1/MS2                        */
+    uint8_t        addr;            /* 0..3 per MS1/MS2                         */
 
-    /* Shadow register */
+    /* Shadow registers */
     uint32_t       gconf;
     uint32_t       ihold_irun;
     uint32_t       chopconf;
@@ -97,17 +97,17 @@ typedef struct {
     uint32_t       tcoolthrs;
     uint32_t       sgthrs;
     int32_t        vactual;
-    uint8_t        toff;            /* TOFF lưu lại để enable/disable           */
+    uint8_t        toff;            /* TOFF kept so it can be re-applied on enable/disable */
     bool           cool_step_enabled;
 
-    /* Chân EN phần cứng (tuỳ chọn, active-low) */
+    /* Hardware EN pin (optional, active-low) */
     GPIO_TypeDef  *en_port;
     uint16_t       en_pin;
 
-    /* Ramp vận tốc qua UART (VACTUAL), đơn vị microstep/s */
+    /* Velocity ramp over UART (VACTUAL), in microsteps/s */
     float          vr_target;
     float          vr_current;
-    float          vr_accel;        /* µstep/s^2, 0 = không ramp                */
+    float          vr_accel;        /* µstep/s^2, 0 = no ramp                   */
     uint32_t       vr_last_ms;
     bool           vr_active;
 } tmc2209_t;
@@ -164,47 +164,47 @@ typedef struct {
 /*  Bus                                                                        */
 /* ========================================================================== */
 
-/** huart đã được MX_USARTx_UART_Init() khởi tạo. Với TMC_UART_TX_RX cần bật
- *  NVIC global interrupt của USART trong CubeMX (dùng HAL_UART_Receive_IT). */
+/** huart must already be initialized by MX_USARTx_UART_Init(). For TMC_UART_TX_RX
+ *  you must enable the USART global NVIC interrupt in CubeMX (uses HAL_UART_Receive_IT). */
 tmc_status_t tmc_bus_init(tmc_bus_t *bus, UART_HandleTypeDef *huart, tmc_uart_mode_t mode);
 void         tmc_bus_set_lock(tmc_bus_t *bus, void (*lock)(void *), void (*unlock)(void *), void *ctx);
 bool         tmc_bus_can_read(const tmc_bus_t *bus);
 
 /* ========================================================================== */
-/*  Khởi tạo / low-level                                                       */
+/*  Initialization / low-level                                                */
 /* ========================================================================== */
 
-/** Tương đương TMC2209::setup(): chuyển sang chế độ UART, nạp default,
- *  dòng tối thiểu, driver ở trạng thái DISABLE (phải gọi enable sau). */
+/** Equivalent to TMC2209::setup(): switches to UART mode, loads the defaults,
+ *  sets minimum current, driver left in DISABLE state (must call enable afterwards). */
 tmc_status_t tmc2209_init(tmc2209_t *dev, tmc_bus_t *bus, uint8_t addr);
 
 tmc_status_t tmc2209_write_reg(tmc2209_t *dev, uint8_t reg, uint32_t value);
 tmc_status_t tmc2209_read_reg(tmc2209_t *dev, uint8_t reg, uint32_t *value);
 
-/** Đọc lại GCONF/CHOPCONF/PWMCONF từ chip vào shadow (chỉ khi bus đọc được). */
+/** Re-read GCONF/CHOPCONF/PWMCONF from the chip into the shadow (only if the bus can read). */
 tmc_status_t tmc2209_sync_from_chip(tmc2209_t *dev);
-/** Ghi lại toàn bộ shadow xuống chip (dùng sau khi phát hiện chip bị reset). */
+/** Write the entire shadow back down to the chip (use after detecting a chip reset). */
 tmc_status_t tmc2209_restore_to_chip(tmc2209_t *dev);
 
 /* ========================================================================== */
-/*  API ghi (dùng được cả ở TX-only) — tên bám theo thư viện gốc               */
+/*  Write API (usable even in TX-only) — names follow the original library    */
 /* ========================================================================== */
 
 void         tmc2209_set_hardware_enable_pin(tmc2209_t *dev, GPIO_TypeDef *port, uint16_t pin);
 tmc_status_t tmc2209_enable(tmc2209_t *dev);
 tmc_status_t tmc2209_disable(tmc2209_t *dev);
 
-/** 1,2,4,...,256 (giá trị khác làm tròn xuống luỹ thừa 2). */
+/** 1,2,4,...,256 (other values are rounded down to a power of two). */
 tmc_status_t tmc2209_set_microsteps_per_step(tmc2209_t *dev, uint16_t microsteps);
 tmc_status_t tmc2209_set_microsteps_per_step_power_of_two(tmc2209_t *dev, uint8_t exponent);
-uint16_t     tmc2209_get_microsteps_per_step(const tmc2209_t *dev);   /* từ shadow */
+uint16_t     tmc2209_get_microsteps_per_step(const tmc2209_t *dev);   /* from shadow */
 
 tmc_status_t tmc2209_set_run_current(tmc2209_t *dev, uint8_t percent);   /* 0..100 */
 tmc_status_t tmc2209_set_hold_current(tmc2209_t *dev, uint8_t percent);  /* 0..100 */
 tmc_status_t tmc2209_set_hold_delay(tmc2209_t *dev, uint8_t percent);    /* 0..100 */
 tmc_status_t tmc2209_set_all_current_values(tmc2209_t *dev, uint8_t run_pct,
                                             uint8_t hold_pct, uint8_t hold_delay_pct);
-/** Dòng RMS theo mA với điện trở sense (Ω), hold = run * hold_multiplier. */
+/** RMS current in mA given the sense resistor (Ω); hold = run * hold_multiplier. */
 tmc_status_t tmc2209_set_rms_current(tmc2209_t *dev, uint16_t mA, float r_sense, float hold_multiplier);
 
 tmc_status_t tmc2209_enable_double_edge(tmc2209_t *dev);
@@ -223,8 +223,8 @@ tmc_status_t tmc2209_disable_automatic_gradient_adaptation(tmc2209_t *dev);
 tmc_status_t tmc2209_set_pwm_offset(tmc2209_t *dev, uint8_t pwm_amplitude);
 tmc_status_t tmc2209_set_pwm_gradient(tmc2209_t *dev, uint8_t pwm_amplitude);
 
-tmc_status_t tmc2209_set_power_down_delay(tmc2209_t *dev, uint8_t delay);   /* >=2 để auto-tune */
-/** SENDDELAY 0..15. Nên >= 2 khi có nhiều địa chỉ trên bus 2 chiều. */
+tmc_status_t tmc2209_set_power_down_delay(tmc2209_t *dev, uint8_t delay);   /* >=2 for auto-tune */
+/** SENDDELAY 0..15. Should be >= 2 when several addresses share a two-way bus. */
 tmc_status_t tmc2209_set_reply_delay(tmc2209_t *dev, uint8_t delay);
 
 tmc_status_t tmc2209_enable_stealth_chop(tmc2209_t *dev);
@@ -242,25 +242,25 @@ tmc_status_t tmc2209_disable_analog_current_scaling(tmc2209_t *dev);
 tmc_status_t tmc2209_use_external_sense_resistors(tmc2209_t *dev);
 tmc_status_t tmc2209_use_internal_sense_resistors(tmc2209_t *dev);
 
-/* ---- Điều khiển vận tốc qua UART (bộ phát xung nội của TMC2209) ----------- */
+/* ---- Velocity control over UART (TMC2209's internal step generator) ------- */
 
-/** Ghi thẳng VACTUAL (đơn vị thô, ~0.715 µstep/s mỗi LSB). Khác 0 => chân STEP bị bỏ qua. */
+/** Write VACTUAL directly (raw units, ~0.715 µstep/s per LSB). Nonzero => the STEP pin is ignored. */
 tmc_status_t tmc2209_move_at_velocity(tmc2209_t *dev, int32_t vactual);
-/** VACTUAL = 0 => quay lại dùng chân STEP/DIR (bắt buộc trước khi dùng tmc2209_motion). */
+/** VACTUAL = 0 => go back to using the STEP/DIR pins (required before using tmc2209_motion). */
 tmc_status_t tmc2209_move_using_step_dir_interface(tmc2209_t *dev);
 
-/** Chuyển µstep/s <-> VACTUAL (dùng clock nội 12 MHz; nên đo kiểm lại thực tế). */
+/** Convert µstep/s <-> VACTUAL (uses the internal 12 MHz clock; should be re-measured in practice). */
 int32_t      tmc2209_usteps_per_s_to_vactual(float usteps_per_s);
 float        tmc2209_vactual_to_usteps_per_s(int32_t vactual);
 
-/** Đặt vận tốc đích có ramp (µstep/s, µstep/s^2). accel = 0 => nhảy thẳng.
- *  Phải gọi tmc2209_velocity_ramp_task() định kỳ (5..20 ms). */
+/** Set a target velocity with a ramp (µstep/s, µstep/s^2). accel = 0 => step change.
+ *  tmc2209_velocity_ramp_task() must be called periodically (5..20 ms). */
 tmc_status_t tmc2209_velocity_ramp_set(tmc2209_t *dev, float target_usteps_per_s, float accel);
 tmc_status_t tmc2209_velocity_ramp_task(tmc2209_t *dev);
 bool         tmc2209_velocity_ramp_reached(const tmc2209_t *dev);
 
 /* ========================================================================== */
-/*  API đọc (cần bus TX_RX hoặc HALF_DUPLEX)                                   */
+/*  Read API (requires a TX_RX or HALF_DUPLEX bus)                            */
 /* ========================================================================== */
 
 tmc_status_t tmc2209_get_version(tmc2209_t *dev, uint8_t *version);
@@ -284,7 +284,7 @@ tmc_status_t tmc2209_get_pwm_offset_auto(tmc2209_t *dev, uint8_t *v);
 tmc_status_t tmc2209_get_pwm_gradient_auto(tmc2209_t *dev, uint8_t *v);
 tmc_status_t tmc2209_get_microstep_counter(tmc2209_t *dev, uint16_t *mscnt);
 
-/** Dò địa chỉ 0..3 trên bus, trả về bitmask địa chỉ có phản hồi. */
+/** Probe addresses 0..3 on the bus, return a bitmask of the addresses that responded. */
 uint8_t      tmc2209_scan_bus(tmc_bus_t *bus);
 
 const char  *tmc2209_status_str(tmc_status_t s);

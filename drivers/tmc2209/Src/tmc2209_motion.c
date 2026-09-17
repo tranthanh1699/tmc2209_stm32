@@ -1,17 +1,17 @@
 /**
  * @file    tmc2209_motion.c
- * @brief   Bộ phát xung STEP/DIR có ramp hình thang (fixed-tick DDS).
+ * @brief   Trapezoidal-ramp STEP/DIR pulse generator (fixed-tick DDS).
  */
 #include "tmc2209_motion.h"
 #include <string.h>
 
 #define TWO_POW_64          18446744073709551616.0
-#define Q64_MAX_DOUBLE      18446744073709549568.0   /* double lớn nhất < 2^64 */
+#define Q64_MAX_DOUBLE      18446744073709549568.0   /* largest double < 2^64 */
 #define Q63_DOUBLE          9223372036854775808.0
-#define STOP_TOL_STEPS      2U   /* sai số lượng tử của ramp khi về đích     */
+#define STOP_TOL_STEPS      2U   /* ramp quantization error when reaching target */
 
 /* ========================================================================== */
-/*  Chuyển đổi đơn vị (thread context, dùng double)                            */
+/*  Unit conversion (thread context, uses double)                             */
 /* ========================================================================== */
 
 static uint64_t speed_to_q(const tmc_motion_t *m, float speed)
@@ -50,7 +50,7 @@ static double q_to_speed(const tmc_motion_t *m, uint64_t q)
     return (double)q / TWO_POW_64 * (double)m->cfg.tick_hz;
 }
 
-/** Số bước cần để phanh từ vận tốc hiện tại về start_speed: s = (v^2 - v0^2) / 2a */
+/** Number of steps needed to brake from the current velocity to start_speed: s = (v^2 - v0^2) / 2a */
 static uint32_t ramp_steps_for(const tmc_motion_t *m, uint64_t vel_q, float accel)
 {
     double v, v0, s;
@@ -67,7 +67,7 @@ static uint32_t ramp_steps_for(const tmc_motion_t *m, uint64_t vel_q, float acce
 }
 
 /* ========================================================================== */
-/*  Helper trong ISR                                                           */
+/*  Helpers used in the ISR                                                    */
 /* ========================================================================== */
 
 static void set_dir(tmc_motion_t *m, int8_t d)
@@ -99,14 +99,14 @@ static uint64_t floor_q(const tmc_motion_t *m)
     return m->vmax_q;
 }
 
-/* Gọi trong critical section */
+/* Called inside a critical section */
 static void start_if_idle(tmc_motion_t *m)
 {
     if (m->running) {
         return;
     }
     m->vel_q      = m->no_ramp ? m->vmax_q : floor_q(m);
-    m->phase      = UINT32_MAX;         /* bước đầu tiên phát ngay tick kế tiếp */
+    m->phase      = UINT32_MAX;         /* first step is emitted on the very next tick */
     m->ramp_steps = 0;
     m->ramp_state = TMC_RAMP_ACCEL;
     m->running    = true;
@@ -120,11 +120,11 @@ void tmc_motion_tick(tmc_motion_t *m)
 {
     int8_t   want;
     int64_t  dist = 0;
-    int      action = 0;           /* +1 tăng tốc, -1 giảm tốc, 0 giữ tốc */
+    int      action = 0;           /* +1 accelerate, -1 decelerate, 0 hold speed */
     uint64_t lo = 0;
     uint32_t inc, old;
 
-    /* Kết thúc xung STEP của tick trước (độ rộng xung = 1 chu kỳ tick) */
+    /* End the STEP pulse from the previous tick (pulse width = 1 tick period) */
     if (m->step_high) {
         TMC_PIN_LOW(m->cfg.step_port, m->cfg.step_pin);
         m->step_high = false;
@@ -140,7 +140,7 @@ void tmc_motion_tick(tmc_motion_t *m)
         want = m->vel_dir;
     }
 
-    /* ---- Đang ở tốc độ thấp nhất: có thể dừng hoặc đảo chiều ---- */
+    /* ---- At the lowest speed: allowed to stop or reverse direction ---- */
     if (m->no_ramp || (m->vel_q <= floor_q(m))) {
         bool done = (m->mode == TMC_MOTION_POSITION) ? (dist == 0) : (m->vmax_q == 0U);
         if (done || (m->mode == TMC_MOTION_IDLE)) {
@@ -148,7 +148,7 @@ void tmc_motion_tick(tmc_motion_t *m)
             return;
         }
         if (want != m->dir) {
-            set_dir(m, want);            /* bỏ bước ở tick này => DIR setup time */
+            set_dir(m, want);            /* skip a step on this tick => DIR setup time */
             m->ramp_steps = 0;
             m->phase      = UINT32_MAX;
             m->vel_q      = m->no_ramp ? m->vmax_q : floor_q(m);
@@ -157,21 +157,21 @@ void tmc_motion_tick(tmc_motion_t *m)
         }
     }
 
-    /* ---- Quyết định tăng/giảm tốc ---- */
+    /* ---- Decide whether to accelerate/decelerate ---- */
     if (m->no_ramp) {
         m->vel_q = m->vmax_q;
     } else if (m->mode == TMC_MOTION_POSITION) {
         int64_t remaining = dist * m->dir;
         if ((remaining <= 0) || (remaining <= (int64_t)m->ramp_steps)) {
-            action = -1; lo = floor_q(m);                 /* phanh về đích        */
+            action = -1; lo = floor_q(m);                 /* brake toward the target   */
         } else if (m->vel_q < m->vmax_q) {
             action = 1;
         } else if (m->vel_q > m->vmax_q) {
-            action = -1; lo = m->vmax_q;                  /* vmax bị giảm giữa chừng */
+            action = -1; lo = m->vmax_q;                  /* vmax was lowered mid-move */
         }
     } else {
         if (want != m->dir) {
-            action = -1; lo = floor_q(m);                 /* phanh để đảo chiều   */
+            action = -1; lo = floor_q(m);                 /* brake to reverse direction */
         } else if (m->vel_q < m->vmax_q) {
             action = 1;
         } else if (m->vel_q > m->vmax_q) {
@@ -190,7 +190,7 @@ void tmc_motion_tick(tmc_motion_t *m)
         m->ramp_state = TMC_RAMP_CRUISE;
     }
 
-    /* ---- DDS: tràn bộ tích luỹ pha => 1 bước ---- */
+    /* ---- DDS: phase accumulator overflow => 1 step ---- */
     inc = (uint32_t)(m->vel_q >> 32);
     old = m->phase;
     m->phase = old + inc;
@@ -294,7 +294,7 @@ void tmc_motion_move_to_ex(tmc_motion_t *m, int32_t target, float max_speed, flo
     uint32_t rs  = ramp_steps_for(m, vel, accel);
 
     if (vq == 0U) {
-        vq = 1ULL << 32;          /* tối thiểu ~F/2^32 µstep/s, tránh kẹt */
+        vq = 1ULL << 32;          /* minimum ~F/2^32 µstep/s, to avoid getting stuck */
     }
     {
         TMC_CRITICAL_ENTER();
@@ -355,7 +355,7 @@ void tmc_motion_run_velocity(tmc_motion_t *m, float usteps_per_s, float accel)
         } else if (usteps_per_s < 0.0f) {
             m->vel_dir = -1;
         } else {
-            m->vel_dir = m->dir;         /* v = 0: phanh theo chiều hiện tại */
+            m->vel_dir = m->dir;         /* v = 0: brake in the current direction */
         }
         if (m->running) {
             m->mode       = TMC_MOTION_VELOCITY;
@@ -391,7 +391,7 @@ bool tmc_motion_is_running(const tmc_motion_t *m)
 
 int32_t tmc_motion_get_position(const tmc_motion_t *m)
 {
-    return m->position;   /* int32 đọc nguyên tử trên Cortex-M */
+    return m->position;   /* int32 read is atomic on Cortex-M */
 }
 
 int32_t tmc_motion_distance_to_go(const tmc_motion_t *m)
