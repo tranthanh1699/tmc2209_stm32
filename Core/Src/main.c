@@ -24,7 +24,8 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "tmc2209.h"
+#include "tmc2209_motion.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -45,7 +46,30 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
+/*
+ * STEP/DIR/EN wiring for the TMC2209 -- NOT configured in the .ioc yet.
+ * Adjust these three defines to match the actual pins on your board, then
+ * add the matching GPIO clock enable in MX_GPIO_Init() if a new GPIO port
+ * shows up here (GPIOC clock is enabled below for PC0/PC1/PC2).
+ */
+#define STEP_GPIO_Port      GPIOC
+#define STEP_Pin            GPIO_PIN_0
+#define DIR_GPIO_Port       GPIOC
+#define DIR_Pin             GPIO_PIN_1
+#define EN_GPIO_Port        GPIOC
+#define EN_Pin              GPIO_PIN_2
 
+/* MS1=0, MS2=0 -> UART slave address 0 (see TMC2209 datasheet §5) */
+#define TMC_DRIVER_ADDR     0U
+
+#define MICROSTEPS          16U
+#define FULL_STEPS_REV      200U
+#define USTEPS_PER_REV      (FULL_STEPS_REV * MICROSTEPS)   /* 3200 */
+#define MOTION_TICK_HZ      20000U                          /* matches TIM6: 240 MHz / 240 / 50 */
+
+static tmc_bus_t    tmc_bus;
+static tmc2209_t    tmc_drv;
+static tmc_motion_t axis;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -57,7 +81,49 @@ static void MPU_Config(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+/** STEP/DIR/EN pins are plain GPIO outputs, not managed by CubeMX/.ioc yet. */
+static void stepper_gpio_init(void)
+{
+    GPIO_InitTypeDef gi = {0};
 
+    __HAL_RCC_GPIOC_CLK_ENABLE();
+
+    HAL_GPIO_WritePin(STEP_GPIO_Port, STEP_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(DIR_GPIO_Port,  DIR_Pin,  GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(EN_GPIO_Port,   EN_Pin,   GPIO_PIN_SET);   /* EN active-low -> start disabled */
+
+    gi.Pin   = STEP_Pin | DIR_Pin | EN_Pin;
+    gi.Mode  = GPIO_MODE_OUTPUT_PP;
+    gi.Pull  = GPIO_NOPULL;
+    gi.Speed = GPIO_SPEED_FREQ_HIGH;
+    HAL_GPIO_Init(STEP_GPIO_Port, &gi);   /* all three pins are on GPIOC here */
+}
+
+static void driver_setup(tmc2209_t *d, uint8_t addr, GPIO_TypeDef *en_port, uint16_t en_pin)
+{
+    tmc_status_t st = tmc2209_init(d, &tmc_bus, addr);
+    if (st != TMC_OK) {
+        /* Most common causes: VM/VS not powered, wrong MS1/MS2 address,
+         * or USART NVIC interrupt not enabled. */
+        Error_Handler();
+    }
+    tmc2209_set_hardware_enable_pin(d, en_port, en_pin);
+    tmc2209_set_microsteps_per_step(d, MICROSTEPS);
+    tmc2209_set_run_current(d, 60);        /* % */
+    tmc2209_set_hold_current(d, 30);       /* % */
+    tmc2209_set_hold_delay(d, 50);         /* % */
+    tmc2209_enable_automatic_current_scaling(d);   /* StealthChop auto-tuning */
+    tmc2209_enable_automatic_gradient_adaptation(d);
+    tmc2209_enable_stealth_chop(d);
+    tmc2209_enable(d);
+}
+
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+    if (htim->Instance == TIM6) {
+        tmc_motion_tick(&axis);
+    }
+}
 /* USER CODE END 0 */
 
 /**
@@ -95,7 +161,28 @@ int main(void)
   MX_TIM6_Init();
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
+  stepper_gpio_init();
 
+  /* USART1: PB14/PB15 both tied to the driver's PDN_UART -> TX_RX mode, the
+   * MCU sees its own echo and the library filters it out automatically. */
+  tmc_bus_init(&tmc_bus, &huart1, TMC_UART_TX_RX);
+
+  driver_setup(&tmc_drv, TMC_DRIVER_ADDR, EN_GPIO_Port, EN_Pin);
+
+  tmc_motion_cfg_t motion_cfg = {
+      STEP_GPIO_Port, STEP_Pin, DIR_GPIO_Port, DIR_Pin,
+      MOTION_TICK_HZ, false /* dir_invert */, true /* double_edge */
+  };
+  tmc_motion_init(&axis, &motion_cfg, &tmc_drv);   /* also sets VACTUAL = 0 */
+
+  tmc_motion_set_start_speed(&axis, 200.0f);                    /* µsteps/s */
+  tmc_motion_set_max_speed(&axis, 2.0f * USTEPS_PER_REV);       /* 2 rev/s  */
+  tmc_motion_set_acceleration(&axis, 4.0f * USTEPS_PER_REV);    /* 4 rev/s² */
+
+  HAL_TIM_Base_Start_IT(&htim6);
+
+  /* Kick off the demo: 4 full revolutions from the current position */
+  tmc_motion_move(&axis, 4 * (int32_t)USTEPS_PER_REV);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -105,6 +192,43 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    static uint32_t t_diag = 0;
+    static uint8_t  phase  = 0;
+    uint32_t        now    = HAL_GetTick();
+
+    /* Simple back-and-forth demo sequence, one step whenever the axis is idle */
+    if (!tmc_motion_is_running(&axis)) {
+      switch (phase) {
+      case 0:   /* run back to the origin */
+        tmc_motion_move_to(&axis, 0);
+        phase = 1;
+        break;
+      case 1:   /* run out 4 revolutions again */
+        tmc_motion_move(&axis, 4 * (int32_t)USTEPS_PER_REV);
+        phase = 0;
+        break;
+      default:
+        break;
+      }
+    }
+
+    /* 500 ms supervision: detect a driver reset (VS loss) and reload the config,
+     * and disable the driver on a fault condition. */
+    if ((now - t_diag) >= 500U) {
+      tmc2209_gstat_t  gs;
+      tmc2209_status_t st;
+      t_diag = now;
+
+      if ((tmc2209_get_global_status(&tmc_drv, &gs) == TMC_OK) && gs.reset) {
+        tmc2209_restore_to_chip(&tmc_drv);
+      }
+      if (tmc2209_get_status(&tmc_drv, &st) == TMC_OK) {
+        if (st.over_temperature_shutdown || st.short_to_ground_a || st.short_to_ground_b) {
+          tmc_motion_emergency_stop(&axis);
+          tmc2209_disable(&tmc_drv);
+        }
+      }
+    }
   }
   /* USER CODE END 3 */
 }
