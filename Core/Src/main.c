@@ -18,6 +18,8 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "adc.h"
+#include "dma.h"
 #include "tim.h"
 #include "usart.h"
 #include "gpio.h"
@@ -26,6 +28,7 @@
 /* USER CODE BEGIN Includes */
 #include "tmc2209.h"
 #include "tmc2209_motion.h"
+#include "adc_tracker.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -66,10 +69,34 @@
 #define FULL_STEPS_REV      200U
 #define USTEPS_PER_REV      (FULL_STEPS_REV * MICROSTEPS)   /* 3200 */
 #define MOTION_TICK_HZ      20000U                          /* matches TIM6: 240 MHz / 240 / 50 */
+#define USTEPS_PER_DEG      ((float)USTEPS_PER_REV / 360.0f)
+
+/*
+ * Analog input (potentiometer on PB1 / ADC1_IN5) -> motor angle.
+ * ADC1 is triggered by TIM6 TRGO, so TIM6 is shared with the motion tick:
+ * ADC sample rate = MOTION_TICK_HZ; TIM6 counter clock = 240 MHz / 240 = 1 MHz.
+ * Tracker update rate = MOTION_TICK_HZ / ADC_AVG_SAMPLES = 1250 Hz.
+ *
+ * Absolute mapping: motor angle = MOTOR_DEG_PER_POT_DEG * pot angle, assuming
+ * the motor shaft is at 0 deg (axis position 0) at power-up.
+ */
+#define TIM6_COUNTER_HZ         1000000u
+#define ADC_AVG_SAMPLES         16u            /* 16 x uint16 = one 32 B cache line per DMA half */
+#define ADC_RAW_MAX             65535.0f       /* ADC1 is configured for 16-bit resolution */
+#define POT_FULL_SCALE_DEG      270.0f         /* mechanical travel of the pot */
+#define MOTOR_DEG_PER_POT_DEG   1.0f           /* 1.0 = motor shaft follows the pot 1:1 */
+#define MAX_SPEED_DPS           720.0f         /* 2 rev/s, same as tmc_motion max speed */
+#define MIN_SPEED_DPS           30.0f          /* floor of the speed limit while tracking */
+#define ALIGN_SPEED_DPS         180.0f         /* speed of the initial move to the pot angle */
+#define MOTION_ACCEL_USPS2      (4.0f * USTEPS_PER_REV)   /* 4 rev/s² */
 
 static tmc_bus_t    tmc_bus;
 static tmc2209_t    tmc_drv;
 static tmc_motion_t axis;
+
+/* DMA1 cannot reach DTCM: this object holds the DMA buffer, so it is placed in
+ * AXI SRAM through the .dma_buffer section (see STM32H743XX_FLASH.ld). */
+__attribute__((section(".dma_buffer"))) static ADCTRK_HandleTypeDef tracker;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -118,6 +145,12 @@ static void driver_setup(tmc2209_t *d, uint8_t addr, GPIO_TypeDef *en_port, uint
     tmc2209_enable(d);
 }
 
+/** Degrees -> µsteps (rounded to nearest). */
+static int32_t deg_to_usteps(float deg)
+{
+    return tmc_mm_to_usteps(deg, USTEPS_PER_DEG);
+}
+
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
     if (htim->Instance == TIM6) {
@@ -158,8 +191,10 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_TIM6_Init();
   MX_USART1_UART_Init();
+  MX_ADC1_Init();
   /* USER CODE BEGIN 2 */
   stepper_gpio_init();
 
@@ -179,10 +214,45 @@ int main(void)
   tmc_motion_set_max_speed(&axis, 2.0f * USTEPS_PER_REV);       /* 2 rev/s  */
   tmc_motion_set_acceleration(&axis, 4.0f * USTEPS_PER_REV);    /* 4 rev/s² */
 
-  HAL_TIM_Base_Start_IT(&htim6);
+  /* ADC tracker: TIM6 TRGO -> ADC1 -> circular DMA -> angle / speed */
+  if (HAL_ADCEx_Calibration_Start(&hadc1, ADC_CALIB_OFFSET_LINEARITY, ADC_SINGLE_ENDED) != HAL_OK) {
+    Error_Handler();
+  }
 
-  /* Kick off the demo: 4 full revolutions from the current position */
-  tmc_motion_move(&axis, 4 * (int32_t)USTEPS_PER_REV);
+  ADCTRK_ConfigTypeDef trk_cfg;
+  ADCTRK_GetDefaultConfig(&trk_cfg);
+  trk_cfg.sample_rate_hz   = MOTION_TICK_HZ;
+  trk_cfg.avg_samples      = ADC_AVG_SAMPLES;
+  trk_cfg.raw_min          = 0.0f;
+  trk_cfg.raw_max          = ADC_RAW_MAX;
+  trk_cfg.full_scale_deg   = POT_FULL_SCALE_DEG;
+  trk_cfg.pos_gain         = MOTOR_DEG_PER_POT_DEG;
+  trk_cfg.vel_gain         = MOTOR_DEG_PER_POT_DEG;
+  trk_cfg.out_vel_min_dps  = MIN_SPEED_DPS;
+  trk_cfg.out_vel_max_dps  = MAX_SPEED_DPS;
+  trk_cfg.out_acc_max_dps2 = 0.0f;                 /* ramp is done by tmc_motion */
+  trk_cfg.out_pos_min_deg  = 0.0f;                 /* soft limits on the motor angle */
+  trk_cfg.out_pos_max_deg  = POT_FULL_SCALE_DEG * MOTOR_DEG_PER_POT_DEG;
+  if (ADCTRK_Init(&tracker, &hadc1, &htim6, TIM6_COUNTER_HZ, &trk_cfg) != ADCTRK_OK) {
+    Error_Handler();
+  }
+  if (ADCTRK_Start(&tracker) != ADCTRK_OK) {       /* also starts TIM6 (HAL_TIM_Base_Start) */
+    Error_Handler();
+  }
+  /* TIM6 is now BUSY, so HAL_TIM_Base_Start_IT() would fail: enable the
+   * update interrupt for tmc_motion_tick() directly. */
+  __HAL_TIM_ENABLE_IT(&htim6, TIM_IT_UPDATE);
+
+  /* Wait for the first averaged sample (a timeout means ADC/DMA/TIM6 is misconfigured),
+   * then map the pot's current angle to the motor's current position (0 deg). */
+  ADCTRK_DataTypeDef trk;
+  uint32_t t_start = HAL_GetTick();
+  while (!ADCTRK_GetData(&tracker, &trk)) {
+    if ((HAL_GetTick() - t_start) > 100U) {
+      Error_Handler();
+    }
+  }
+  ADCTRK_SetZero(&tracker, MOTOR_DEG_PER_POT_DEG * trk.in_angle_deg);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -193,22 +263,19 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
     static uint32_t t_diag = 0;
-    static uint8_t  phase  = 0;
+    static bool     aligned = false;
     uint32_t        now    = HAL_GetTick();
 
-    /* Simple back-and-forth demo sequence, one step whenever the axis is idle */
-    if (!tmc_motion_is_running(&axis)) {
-      switch (phase) {
-      case 0:   /* run back to the origin */
-        tmc_motion_move_to(&axis, 0);
-        phase = 1;
-        break;
-      case 1:   /* run out 4 revolutions again */
-        tmc_motion_move(&axis, 4 * (int32_t)USTEPS_PER_REV);
-        phase = 0;
-        break;
-      default:
-        break;
+    /* New tracker update (~1250 Hz): retarget the axis to the pot angle. The speed
+     * limit follows how fast the pot is turned; tmc_motion handles ramp and reversal.
+     * The first move (motor 0 deg -> pot angle) runs at a fixed, moderate speed. */
+    ADCTRK_DataTypeDef trk_data;
+    if (ADCTRK_GetData(&tracker, &trk_data)) {
+      float v_dps = aligned ? trk_data.out_vel_limit_dps : ALIGN_SPEED_DPS;
+      tmc_motion_move_to_ex(&axis, deg_to_usteps(trk_data.out_target_deg),
+                            v_dps * USTEPS_PER_DEG, MOTION_ACCEL_USPS2);
+      if (!aligned && !tmc_motion_is_running(&axis)) {
+        aligned = true;
       }
     }
 
