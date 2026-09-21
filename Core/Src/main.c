@@ -55,12 +55,12 @@
  * add the matching GPIO clock enable in MX_GPIO_Init() if a new GPIO port
  * shows up here (GPIOC clock is enabled below for PC0/PC1/PC2).
  */
-#define STEP_GPIO_Port      GPIOC
-#define STEP_Pin            GPIO_PIN_0
-#define DIR_GPIO_Port       GPIOC
-#define DIR_Pin             GPIO_PIN_1
-#define EN_GPIO_Port        GPIOC
-#define EN_Pin              GPIO_PIN_2
+#define STEP_GPIO_Port      GPIOA
+#define STEP_Pin            GPIO_PIN_5
+#define DIR_GPIO_Port       GPIOA
+#define DIR_Pin             GPIO_PIN_6
+#define EN_GPIO_Port        GPIOA
+#define EN_Pin              GPIO_PIN_7
 
 /* MS1=0, MS2=0 -> UART slave address 0 (see TMC2209 datasheet §5) */
 #define TMC_DRIVER_ADDR     0U
@@ -113,7 +113,7 @@ static void stepper_gpio_init(void)
 {
     GPIO_InitTypeDef gi = {0};
 
-    __HAL_RCC_GPIOC_CLK_ENABLE();
+    __HAL_RCC_GPIOA_CLK_ENABLE();
 
     HAL_GPIO_WritePin(STEP_GPIO_Port, STEP_Pin, GPIO_PIN_RESET);
     HAL_GPIO_WritePin(DIR_GPIO_Port,  DIR_Pin,  GPIO_PIN_RESET);
