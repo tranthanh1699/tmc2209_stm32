@@ -200,7 +200,7 @@ int main(void)
 
   /* USART1: PB14/PB15 both tied to the driver's PDN_UART -> TX_RX mode, the
    * MCU sees its own echo and the library filters it out automatically. */
-  tmc_bus_init(&tmc_bus, &huart1, TMC_UART_TX_RX);
+  tmc_bus_init(&tmc_bus, &huart1, TMC_UART_TX_ONLY);
 
   driver_setup(&tmc_drv, TMC_DRIVER_ADDR, EN_GPIO_Port, EN_Pin);
 
